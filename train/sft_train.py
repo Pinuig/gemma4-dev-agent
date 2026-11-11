@@ -1,98 +1,49 @@
+"""Supervised fine-tuning for Gemma 4 using chat trajectory JSONL and LoRA.
+Each JSONL row: {"messages":[{"role":"user","content":"..."},{"role":"assistant","content":"..."}, ...]}.
 """
-Supervised Fine-Tuning of Gemma 4 with Unsloth + QLoRA on code-editing trajectories.
-
-Usage (Kaggle L4x4 or local with enough VRAM): python train/sft_train.py --data_path data/trajectories.jsonl --output_dir adapters/sft
-"""
-
-from __future__ import annotations
-
-import argparse
-import json
+import argparse,json
 from pathlib import Path
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--model_name", default="google/gemma-4-31b-it-qat-w4a16-ct")
-    parser.add_argument("--data_path", required=True, help="JSONL with {messages: [...]} or {prompt, completion}")
-    parser.add_argument("--output_dir", default="adapters/sft_lora")
-    parser.add_argument("--max_seq_length", type=int, default=8192)
-    parser.add_argument("--num_epochs", type=int, default=2)
-    parser.add_argument("--batch_size", type=int, default=1)
-    parser.add_argument("--grad_accum", type=int, default=8)
-    parser.add_argument("--learning_rate", type=float, default=2e-4)
-    parser.add_argument("--lora_r", type=int, default=16)
-    parser.add_argument("--lora_alpha", type=int, default=32)
-    args = parser.parse_args()
-
-    try:
-        from unsloth import FastLanguageModel
-        from trl import SFTTrainer
-        from transformers import TrainingArguments
-        from datasets import load_dataset
-    except ImportError as e:
-        print("Missing dependency. Install with:")
-        print("  pip install unsloth transformers trl datasets peft accelerate")
-        raise SystemExit(1) from e
-
-    print(f"Loading model: {args.model_name}")
-    model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name=args.model_name,
-        max_seq_length=args.max_seq_length,
-        dtype=None,
-        load_in_4bit=True,
-    )
-
-    model = FastLanguageModel.get_peft_model(
-        model,
-        r=args.lora_r,
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
-                        "gate_proj", "up_proj", "down_proj"],
-        lora_alpha=args.lora_alpha,
-        lora_dropout=0.05,
-        bias="none",
-        use_gradient_checkpointing="unsloth",
-        random_state=42,
-    )
-
-    ds = load_dataset("json", data_files=args.data_path, split="train")
-
-    def formatting_func(examples):
-        if "text" in examples:
-            return examples["text"]
-        if "messages" in examples:
-            return [tokenizer.apply_chat_template(m, tokenize=False) for m in examples["messages"]]
-        if "prompt" in examples and "completion" in examples:
-            return [p + c for p, c in zip(examples["prompt"], examples["completion"])]
-        raise ValueError("Dataset must contain 'text', 'messages' or 'prompt'+'completion'")
-
-    trainer = SFTTrainer(
-        model=model,
-        tokenizer=tokenizer,
-        train_dataset=ds,
-        dataset_text_field="text",          
-        max_seq_length=args.max_seq_length,
-        formatting_func=formatting_func if "messages" in ds.column_names or "prompt" in ds.column_names else None,
-        args=TrainingArguments(
-            output_dir=args.output_dir,
-            per_device_train_batch_size=args.batch_size,
-            gradient_accumulation_steps=args.grad_accum,
-            num_train_epochs=args.num_epochs,
-            learning_rate=args.learning_rate,
-            fp16=True,
-            logging_steps=10,
-            save_strategy="epoch",
-            optim="adamw_8bit",
-            seed=42,
-            report_to="none",
-        ),
-    )
-
-    print("Starting SFT...")
-    trainer.train()
-    model.save_pretrained(args.output_dir)
-    tokenizer.save_pretrained(args.output_dir)
-    print(f"LoRA adapter saved to {args.output_dir}")
-
-
-if __name__ == "__main__":
-    main()
+ p=argparse.ArgumentParser(); p.add_argument('--model_name',required=True); p.add_argument('--data_path',required=True); p.add_argument('--output_dir',default='adapters/sft'); p.add_argument('--epochs',type=float,default=2); p.add_argument('--lr',type=float,default=1e-4); p.add_argument('--max_length',type=int,default=4096); p.add_argument('--batch_size',type=int,default=1); p.add_argument('--grad_accum',type=int,default=8); p.add_argument('--lora_r',type=int,default=16); p.add_argument('--load_in_4bit',action='store_true'); args=p.parse_args()
+ try:
+  import torch
+  from datasets import Dataset
+  from transformers import AutoProcessor,AutoModelForMultimodalLM,Trainer,TrainingArguments
+  from peft import LoraConfig,get_peft_model,prepare_model_for_kbit_training
+ except ImportError as e: raise SystemExit('Install compatible torch, transformers>=5.10.1, datasets, peft, accelerate.') from e
+ rows=[json.loads(x) for x in Path(args.data_path).read_text().splitlines() if x.strip()]
+ if not rows: raise SystemExit('No training examples found.')
+ processor=AutoProcessor.from_pretrained(args.model_name); tokenizer=processor.tokenizer
+ if tokenizer.pad_token_id is None: tokenizer.pad_token=tokenizer.eos_token
+ model=AutoModelForMultimodalLM.from_pretrained(args.model_name,dtype='auto',device_map='auto',load_in_4bit=args.load_in_4bit)
+ if args.load_in_4bit: model=prepare_model_for_kbit_training(model)
+ lora=LoraConfig(r=args.lora_r,lora_alpha=args.lora_r*2,lora_dropout=0.05,bias='none',task_type='CAUSAL_LM',target_modules='all-linear')
+ model=get_peft_model(model,lora); model.print_trainable_parameters()
+ encoded_rows=[]
+ for i,row in enumerate(rows):
+  if 'messages' not in row: raise ValueError(f'Row {i} missing messages')
+  messages=row['messages']
+  full_ids=tokenizer(processor.apply_chat_template(messages,tokenize=False,add_generation_prompt=False),truncation=True,max_length=args.max_length)['input_ids']
+  labels=[-100]*len(full_ids)
+  # Supervise assistant turns only; system/user/tool observations are context.
+  for j,msg in enumerate(messages):
+   if msg.get('role')!='assistant': continue
+   prefix=messages[:j]
+   prefix_text=processor.apply_chat_template(prefix,tokenize=False,add_generation_prompt=True)
+   end_text=processor.apply_chat_template(messages[:j+1],tokenize=False,add_generation_prompt=False)
+   begin=len(tokenizer(prefix_text,truncation=True,max_length=args.max_length)['input_ids'])
+   end=min(len(full_ids),len(tokenizer(end_text,truncation=True,max_length=args.max_length)['input_ids']))
+   for k in range(min(begin,len(labels)),end): labels[k]=full_ids[k]
+  if not any(x!=-100 for x in labels): raise ValueError(f'Row {i} contains no assistant tokens after truncation')
+  encoded_rows.append((full_ids,labels))
+ class ChatDataset(torch.utils.data.Dataset):
+  def __len__(self): return len(encoded_rows)
+  def __getitem__(self,i):
+   ids,labels=encoded_rows[i]; pad=args.max_length-len(ids)
+   return {'input_ids':torch.tensor(ids+[tokenizer.pad_token_id or tokenizer.eos_token_id]*pad,dtype=torch.long),'attention_mask':torch.tensor([1]*len(ids)+[0]*pad,dtype=torch.long),'labels':torch.tensor(labels+[-100]*pad,dtype=torch.long)}
+ out=Path(args.output_dir); out.mkdir(parents=True,exist_ok=True)
+ train_args=TrainingArguments(output_dir=str(out),num_train_epochs=args.epochs,per_device_train_batch_size=args.batch_size,gradient_accumulation_steps=args.grad_accum,learning_rate=args.lr,logging_steps=5,save_strategy='epoch',gradient_checkpointing=True,fp16=torch.cuda.is_available() and not torch.cuda.is_bf16_supported(),bf16=torch.cuda.is_available() and torch.cuda.is_bf16_supported(),report_to='none',remove_unused_columns=False)
+ trainer=Trainer(model=model,args=train_args,train_dataset=ChatDataset()); trainer.train(); model.save_pretrained(out); processor.save_pretrained(out)
+ print(f'SFT adapter saved to {out}')
+if __name__=='__main__': main()

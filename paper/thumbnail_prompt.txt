@@ -1,0 +1,14 @@
+Create a professional 560×280 dark-mode thumbnail for a Kaggle research paper.
+
+Layout:
+- Dark navy / near-black background
+- Clean white and electric-blue text
+- Title at top: "Gemma 4 DevAgent"
+- Subtitle: "AST + SFT + GRPO"
+- Center: horizontal flowchart with 5 rounded boxes connected by arrows:
+
+  User Request → AST Search → Patch Generation → Pytest Sandbox → 200 OK
+
+- Small robot / agent icon on the left
+- Subtle code-bracket watermark in the background
+- High contrast, modern, research-paper aesthetic (no clutter)
